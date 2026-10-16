@@ -113,28 +113,95 @@ class SkeletonOptimizationAgent(BaselineAgent):
         return 0  # No action
     
     def _get_naive_layout_action(self, current_timestep) -> list:
+        """Greedy profit-oriented slotting: move frequently picked items nearer dispatch.
+
+        Estimate travel savings using item access frequency and the nearest truck bay.
+        Add a small co-occurrence benefit for items typically picked together.
+        Require a manager, limit relocation frequency, and reject unprofitable swaps.
         """
-        WEEK 1 STEP 1: Layout optimization - students should improve this!
-        
-        Current problems:
-        - Random swaps with no strategic purpose
-        - Ignores item co-occurrence patterns
-        - No consideration of delivery distances
-        - Wastes manager time on pointless moves
-        """
-        
-        # TODO WEEK 1 STEP 1: Students should implement intelligent layout optimization
-        # Current approach: Occasionally make random swaps
-        
-        if current_timestep % 100 == 0 and np.random.random() < 0.2:  # Random timing
-            # Pick two random positions to swap
-            grid_size = self.env.grid_width * self.env.grid_height
-            pos1 = np.random.randint(0, grid_size)
-            pos2 = np.random.randint(0, grid_size)
-            return [pos1, pos2]
-        
-        return [0, 0]  # No swap
-    
+        from environment.employee import EmployeeState
+        grid = self.env.warehouse_grid
+        manager = next((e for e in self.env.employees if e.is_manager), None)
+
+        # Relocations require an idle manager and low warehouse pressure.
+        if manager is None or manager.state != EmployeeState.IDLE:
+            return [0, 0]
+        if current_timestep < 100 or current_timestep % 50 != 0:
+            return [0, 0]
+        if len(self.env.order_queue.orders) > max(5, len(self.env.employees) * 3):
+            return [0, 0]
+
+        # Avoid repeatedly moving stock that just moved.
+        if not hasattr(self, "_layout_cooldown"):
+            self._layout_cooldown = {}
+        self._layout_cooldown = {
+            p: t for p, t in self._layout_cooldown.items()
+            if current_timestep - t < 400
+        }
+
+        stations = grid.truck_bay_positions
+        positions = []
+        for y in range(grid.height):
+            for x in range(grid.width):
+                if grid.cell_types[y, x] == 1:  # CellType.STORAGE
+                    item = int(grid.item_grid[y, x])
+                    if item >= 0:
+                        idx = y * grid.width + x
+                        distance = min(abs(x - sx) + abs(y - sy) for sx, sy in stations)
+                        positions.append((idx, item, float(distance)))
+
+        if len(positions) < 2:
+            return [0, 0]
+
+        frequencies = grid.item_access_frequency
+        cooc = grid.item_cooccurrence
+        total_access = float(np.sum(frequencies))
+
+        # Add a small prior so optimization can start with limited observations.
+        def demand(item):
+            return float(frequencies[item]) + 0.1 * total_access / max(1, len(frequencies)) + 0.05
+
+        # Expected reduced travel when swapping item a at far spot with b at near spot:
+        # (d_far - d_near) * (demand_a - demand_b).
+        best_gain, best_swap = 0.0, None
+        far_positions = sorted(positions, key=lambda p: p[2], reverse=True)[:35]
+        near_positions = sorted(positions, key=lambda p: p[2])[:35]
+
+        for a_idx, a_item, a_distance in far_positions:
+            if a_idx in self._layout_cooldown:
+                continue
+            for b_idx, b_item, b_distance in near_positions:
+                if a_idx == b_idx or a_item == b_item or b_idx in self._layout_cooldown:
+                    continue
+                if a_distance <= b_distance:
+                    continue
+                gain = (a_distance - b_distance) * (demand(a_item) - demand(b_item))
+                if gain <= 1.0:
+                    continue
+
+                # Prefer swaps that bring frequently co-ordered stock closer.
+                a_x, a_y = a_idx % grid.width, a_idx // grid.width
+                b_x, b_y = b_idx % grid.width, b_idx // grid.width
+                affinity = 0.0
+                for other_idx, other_item, _ in positions:
+                    if other_idx in (a_idx, b_idx):
+                        continue
+                    x, y = other_idx % grid.width, other_idx // grid.width
+                    before = abs(a_x - x) + abs(a_y - y)
+                    after = abs(b_x - x) + abs(b_y - y)
+                    affinity += float(cooc[a_item, other_item] - cooc[b_item, other_item]) * (before - after)
+                gain += 0.02 * affinity
+
+                if gain > best_gain:
+                    best_gain, best_swap = gain, (a_idx, b_idx)
+
+        # A manager's travel and time are costly: require a meaningful gain.
+        if best_swap is not None and best_gain > 2.0:
+            for pos in best_swap:
+                self._layout_cooldown[pos] = int(current_timestep)
+            return list(best_swap)
+        return [0, 0]
+
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
         """
         WEEK 2 STEP 2: Order assignment - students should improve this!
