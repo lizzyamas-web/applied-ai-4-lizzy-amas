@@ -1,0 +1,14 @@
+Assignment 6 - Initial Baseline
+Agent: skeleton_optimization
+Episodes: 10
+
+Ranking: 8th out of 8
+Average Profit: -$1008.78
+95% Confidence Interval: ±$3.42
+Average Completion Rate: 31.0% ± 5.7%
+
+Layout Relocations:
+Started: 12
+Completed: 8
+Unfinished: 4
+Completion Rate: 66.7%
