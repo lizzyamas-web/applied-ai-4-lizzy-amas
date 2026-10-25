@@ -63,6 +63,7 @@ class SkeletonOptimizationAgent(BaselineAgent):
 
         # Week 1: Reset layout performance history for each episode
         self.layout_performance_history = []
+        self._last_staff_change = -1000
 
         # TODO: Reset any neural network states, replay buffers, etc.
 
@@ -98,36 +99,35 @@ class SkeletonOptimizationAgent(BaselineAgent):
         return action
 
     def _get_naive_staffing_action(self, financial_state, employee_info) -> int:
-        """
-        WEEK 2 STEP 1: Staffing decisions - students should improve this!
+        """Demand-responsive staffing with hysteresis and hiring cooldown."""
+        workers = [e for e in self.env.employees if not getattr(e, 'is_manager', False)]
+        managers = [e for e in self.env.employees if getattr(e, 'is_manager', False)]
+        count = len(workers)
+        backlog = len(self.env.order_queue.orders)
+        profit = float(financial_state[0])
+        timestep = int(getattr(self.env, 'current_timestep', 0))
 
-        Current problems:
-        - Ignores queue length and workload
-        - Random decisions regardless of profit
-        - No consideration of employee efficiency
-        """
+        # Keep a manager to enable the existing layout strategy.
+        if not managers and timestep < 1000 and count >= 2:
+            return 3
 
-        # TODO WEEK 2 STEP 1: Students should implement intelligent staffing logic
-        # Current approach: Make random decisions based on "vibes"
+        # Avoid changing workforce every timestep on transient demand spikes.
+        last_change = getattr(self, '_last_staff_change', -1000)
+        if timestep - last_change < 100:
+            return 0
 
-        current_profit = financial_state[0]
-        num_employees = np.sum(employee_info[:, 0] > 0)  # Count active employees
+        if count < 2:
+            action = 1
+        elif backlog > 3.0 * count and profit > 1000 and count < 12:
+            action = 1
+        elif count > 2 and backlog < 1.5 * count and (profit < 0 or backlog == 0):
+            action = 2
+        else:
+            action = 0
 
-        # Terrible logic: Random decisions with slight bias
-        # BUT: Hire managers more frequently so layout optimization can work
-        has_manager = np.any(employee_info[:, 5] == 1)  # Check if we have a manager
-
-        if np.random.random() < 0.3:  # 30% chance to hire
-            if num_employees < 20:  # Don't go completely overboard
-                return 1  # Hire worker
-        elif np.random.random() < 0.1:  # 10% chance to fire
-            if num_employees > 1:  # Don't fire everyone
-                return 2  # Fire worker
-        elif np.random.random() < 0.2:  # 20% chance to hire manager (increased from 5%)
-            if not has_manager or num_employees > 10:  # Hire manager if we don't have one, or if we have lots of workers
-                return 3  # Hire manager
-
-        return 0  # No action
+        if action:
+            self._last_staff_change = timestep
+        return action
 
     def _get_naive_layout_action(self, current_timestep) -> list:
         """
@@ -437,31 +437,78 @@ class SkeletonOptimizationAgent(BaselineAgent):
 
         return record
 
+    def _get_idle_workers(self, employee_info):
+        """Return (environment employee index, (x,y)) for idle non-managers."""
+        from environment.employee import EmployeeState
+        result = []
+        for idx, worker in enumerate(self.env.employees):
+            if getattr(worker, 'is_manager', False):
+                continue
+            if getattr(worker, 'state', None) != EmployeeState.IDLE:
+                continue
+            if idx >= len(employee_info):
+                continue
+            row = employee_info[idx]
+            if len(row) < 2:
+                continue
+            result.append((idx, (int(row[0]), int(row[1]))))
+        return result
+
+    def _calculate_order_distance(self, worker_pos, order):
+        """Estimate worker travel to the closest required product."""
+        grid = self.env.warehouse_grid
+        required = getattr(order, 'items', [])
+        if isinstance(required, dict):
+            required = required.keys()
+        distances = []
+        for item in required:
+            item_type = getattr(item, 'item_type', item)
+            try:
+                locations = grid.find_item_locations(int(item_type))
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            for loc in locations:
+                distances.append(grid.manhattan_distance(worker_pos, loc))
+        return min(distances) if distances else grid.width + grid.height
+
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
-        """
-        WEEK 2 STEP 2: Order assignment - students should improve this!
+        """Greedy unique matching using 70% proximity and 30% order value."""
+        assignments = [0] * 20
+        workers = self._get_idle_workers(employee_info)
+        orders = list(self.env.order_queue.orders)[:20]
+        if not workers or not orders:
+            return assignments
 
-        Current problems:
-        - Ignores employee locations
-        - No consideration of order priority/value
-        - Random assignments regardless of efficiency
-        - Doesn't check if employees are actually available
-        """
+        def order_value(order):
+            for attr in ('value', 'total_value', 'reward', 'order_value'):
+                value = getattr(order, attr, None)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        pass
+            return 0.0
 
-        # TODO WEEK 2 STEP 2: Students should implement intelligent order assignment
-        # Current approach: Random assignments
+        values = [order_value(o) for o in orders]
+        max_value = max(max(values), 1.0)
+        pairs = []
+        for worker_idx, pos in workers:
+            for order_idx, order in enumerate(orders):
+                distance = self._calculate_order_distance(pos, order)
+                distance_score = 1.0 / (1.0 + distance)
+                value_score = max(0.0, values[order_idx]) / max_value
+                score = 0.7 * distance_score + 0.3 * value_score
+                pairs.append((score, worker_idx, order_idx))
 
-        assignments = [0] * 20  # No assignments by default
-
-        # Count how many employees we have (very naive)
-        num_employees = int(np.sum(employee_info[:, 0] > 0))
-
-        # Randomly assign first few orders to first few employees
-        if num_employees > 0:
-            for i in range(min(3, num_employees)):
-                if np.random.random() < 0.6:
-                    assignments[i] = (i % num_employees) + 1
-
+        used_workers = set()
+        used_orders = set()
+        for score, worker_idx, order_idx in sorted(pairs, reverse=True):
+            if worker_idx in used_workers or order_idx in used_orders:
+                continue
+            # Order slot holds the 1-based employee index (0 means no assignment).
+            assignments[order_idx] = worker_idx + 1
+            used_workers.add(worker_idx)
+            used_orders.add(order_idx)
         return assignments
 
     def record_reward(self, reward: float):
